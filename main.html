@@ -1,0 +1,703 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>러닝 액션 게임</title>
+  <style>
+    :root {
+      --sky-top: #87ceeb;
+      --sky-bottom: #87ceeb;
+      --ground-top: #6bd05a;
+      --ground-bottom: #3fa93a;
+      --ground-stroke: rgba(0, 0, 0, 0.18);
+    }
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: #111;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+    #wrap {
+      width: 100vw;
+      height: 100dvh;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100dvh;
+      image-rendering: auto;
+      border-radius: 0;
+      box-shadow: none;
+      background: linear-gradient(var(--sky-top), var(--sky-bottom));
+      touch-action: none;
+    }
+
+    #hud {
+      position: fixed;
+      right: 14px;
+      top: 14px;
+      z-index: 10;
+      user-select: none;
+      pointer-events: none;
+    }
+    #score {
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(0, 0, 0, 0.28);
+      border: 1px solid rgba(255,255,255,0.18);
+      color: rgba(255,255,255,0.95);
+      font-weight: 700;
+      font-size: 16px;
+      letter-spacing: 0.2px;
+      backdrop-filter: blur(6px);
+      min-width: 120px;
+    }
+
+    #overlay {
+      position: fixed;
+      inset: 0;
+      display: none;
+      place-items: center;
+      z-index: 20;
+      background: rgba(0,0,0,0.35);
+      backdrop-filter: blur(2px);
+    }
+    #overlay.show {
+      display: grid;
+    }
+    .panel {
+      width: min(520px, calc(100vw - 32px));
+      padding: 22px 18px 18px;
+      border-radius: 16px;
+      background: rgba(20, 20, 20, 0.78);
+      border: 1px solid rgba(255,255,255,0.14);
+      box-shadow: 0 18px 60px rgba(0,0,0,0.45);
+      color: rgba(255,255,255,0.95);
+      text-align: center;
+    }
+    .panel h2 {
+      margin: 6px 0 14px;
+      font-size: 42px;
+      letter-spacing: 1px;
+    }
+    .btn {
+      appearance: none;
+      border: 0;
+      border-radius: 12px;
+      padding: 12px 16px;
+      font-weight: 800;
+      font-size: 16px;
+      background: #ffffff;
+      color: #111;
+      cursor: pointer;
+    }
+    .btn:active {
+      transform: translateY(1px);
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" aria-label="러닝 액션 게임 캔버스"></canvas>
+  </div>
+  <div id="hud" aria-hidden="true">
+    <div id="score">점수: 0</div>
+  </div>
+  <div class="hint">스페이스: 점프</div>
+  <div id="overlay" role="dialog" aria-modal="true" aria-label="게임 오버">
+    <div class="panel">
+      <h2>GAME OVER</h2>
+      <div id="finalScore" style="margin: 0 0 14px; font-weight: 800; font-size: 18px; color: rgba(255,255,255,0.92);">
+        점수: 0
+      </div>
+      <button id="restart" class="btn" type="button">다시 하기</button>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      /** @type {HTMLCanvasElement} */
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d', { alpha: false });
+      const scoreEl = document.getElementById('score');
+      const overlayEl = document.getElementById('overlay');
+      const finalScoreEl = document.getElementById('finalScore');
+      const restartEl = document.getElementById('restart');
+
+      const DPR = () => Math.max(1, Math.floor(window.devicePixelRatio || 1));
+
+      const state = {
+        t: 0,
+        lastMs: performance.now(),
+        scrollX: 0,
+        speed: 240, // px/s (월드 스크롤 속도)
+        score: 0,
+        finalScore: 0,
+        clouds: [],
+        nextCloudIn: 0,
+        dust: [],
+        obstacles: [],
+        nextObstacleIn: 0,
+        gameOver: false,
+        ground: {
+          y: 0, // later
+          h: 0
+        },
+        dino: {
+          x: 0,
+          y: 0,
+          w: 56,
+          h: 56,
+          runPhase: 0,
+          vy: 0,
+          jumpImpulse: 680, // px/s
+          gravity: 2200, // px/s^2
+          onGround: true,
+          rot: 0,
+          rotTarget: 0,
+          prevRunPhase: 0
+        }
+      };
+
+      function resize() {
+        const dpr = DPR();
+        const cssW = Math.floor(canvas.getBoundingClientRect().width);
+        const cssH = Math.floor(canvas.getBoundingClientRect().height);
+        canvas.width = Math.max(1, cssW * dpr);
+        canvas.height = Math.max(1, cssH * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+        state.ground.h = Math.max(120, Math.floor(cssH * 0.28));
+        state.ground.y = cssH - state.ground.h;
+
+        state.dino.x = 84;
+        state.dino.y = state.ground.y - state.dino.h + 6;
+      }
+
+      function clamp(v, a, b) {
+        return Math.max(a, Math.min(b, v));
+      }
+
+      function rand(min, max) {
+        return min + Math.random() * (max - min);
+      }
+
+      function spawnDust(x, y) {
+        // 지면 접지감(달릴 때 흙먼지)
+        const n = Math.floor(rand(2, 4));
+        for (let i = 0; i < n; i++) {
+          state.dust.push({
+            x: x + rand(-4, 6),
+            y: y + rand(-2, 4),
+            vx: rand(-120, -60),
+            vy: rand(-60, -20),
+            r: rand(2.5, 5.5),
+            life: rand(0.28, 0.48)
+          });
+        }
+      }
+
+      function scheduleNextCloud() {
+        // "주기적으로 지나감": 일정한 템포에 약간의 랜덤성을만 부여
+        state.nextCloudIn = rand(2.2, 3.8);
+      }
+
+      function scheduleNextObstacle() {
+        state.nextObstacleIn = rand(1.0, 2.2);
+      }
+
+      function spawnCloud() {
+        const w = rand(80, 170);
+        const h = rand(30, 62);
+        const y = rand(40, state.ground.y * 0.55);
+        const speed = rand(70, 120); // 구름은 천천히
+        const x = canvas.getBoundingClientRect().width + w + rand(0, 120);
+        state.clouds.push({ x, y, w, h, speed });
+      }
+
+      function spawnObstacle() {
+        const w = canvas.getBoundingClientRect().width;
+        const size = state.dino.w; // 주인공 크기 정도
+        const x = w + size + rand(40, 160);
+        const y = state.ground.y - size + 6; // 땅에 붙이기
+        state.obstacles.push({ x, y, size });
+      }
+
+      function onJump() {
+        if (state.gameOver) return;
+        if (!state.dino.onGround) return; // 착지 전에는 추가 점프 불가
+        state.dino.onGround = false;
+        state.dino.vy = -state.dino.jumpImpulse;
+        state.dino.rotTarget = (state.dino.rotTarget + Math.PI / 2) % (Math.PI * 2);
+      }
+
+      window.addEventListener('keydown', (e) => {
+        if (e.code === 'Space') {
+          e.preventDefault();
+          onJump();
+        }
+      }, { passive: false });
+
+      // 모바일/터치 편의 (요구사항엔 없지만 기능 추가로 보일 수 있어 제외)
+
+      function drawBackground(w, h) {
+        // 매 프레임 하늘을 직접 칠해(불투명 캔버스 clearRect 검정 문제 방지)
+        ctx.fillStyle = '#87ceeb';
+        ctx.fillRect(0, 0, w, state.ground.y);
+
+        // 약간의 빛 효과
+        const sunX = w * 0.85;
+        const sunY = h * 0.18;
+        const r = Math.min(w, h) * 0.18;
+        const g = ctx.createRadialGradient(sunX, sunY, 0, sunX, sunY, r);
+        g.addColorStop(0, 'rgba(255,255,255,0.55)');
+        g.addColorStop(1, 'rgba(255,255,255,0)');
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, w, state.ground.y);
+      }
+
+      function drawCloud(cl) {
+        ctx.save();
+        ctx.translate(cl.x, cl.y);
+        // 내부 선이 보이지 않도록 스트로크 없이 "한 덩어리"로 표현
+        ctx.fillStyle = 'rgba(255,255,255,0.92)';
+
+        const puff = (x, y, r) => {
+          ctx.beginPath();
+          ctx.arc(x, y, r, 0, Math.PI * 2);
+          ctx.fill();
+        };
+
+        const baseY = cl.h * 0.55;
+        puff(cl.w * 0.30, baseY, cl.h * 0.32);
+        puff(cl.w * 0.50, baseY - cl.h * 0.20, cl.h * 0.40);
+        puff(cl.w * 0.70, baseY, cl.h * 0.34);
+
+        ctx.beginPath();
+        ctx.roundRect(cl.w * 0.22, baseY, cl.w * 0.62, cl.h * 0.42, 18);
+        ctx.fill();
+
+        ctx.restore();
+      }
+
+      function drawGround(w, h, scrollX) {
+        const y = state.ground.y;
+        const gh = state.ground.h;
+
+        // 땅 그라디언트
+        const grd = ctx.createLinearGradient(0, y, 0, y + gh);
+        grd.addColorStop(0, getComputedStyle(document.documentElement).getPropertyValue('--ground-top').trim() || '#6bd05a');
+        grd.addColorStop(1, getComputedStyle(document.documentElement).getPropertyValue('--ground-bottom').trim() || '#3fa93a');
+        ctx.fillStyle = grd;
+        ctx.fillRect(0, y, w, gh);
+
+        // 지평선
+        ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--ground-stroke').trim() || 'rgba(0,0,0,0.18)';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(0, y + 1.5);
+        ctx.lineTo(w, y + 1.5);
+        ctx.stroke();
+
+        // 반복되는 흙 패턴 (끝 없이 이어짐 + 가로로 계속 이동)
+
+        // 흙 타일(점들)
+        ctx.fillStyle = 'rgba(0,0,0,0.08)';
+        const dotStep = 26;
+        for (let xx = -dotStep; xx < w + dotStep; xx += dotStep) {
+          const bx = xx - ((scrollX * 1.1) % dotStep);
+          const yy = y + gh * 0.55;
+          ctx.beginPath();
+          ctx.arc(bx, yy, 3.2, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      function drawObstacle(ob) {
+        ctx.save();
+        ctx.fillStyle = '#ff2d2d';
+        ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+        ctx.lineWidth = 3;
+
+        // 세모(정삼각형 느낌): 바닥에 닿게
+        ctx.beginPath();
+        ctx.moveTo(ob.x, ob.y + ob.size);
+        ctx.lineTo(ob.x + ob.size, ob.y + ob.size);
+        ctx.lineTo(ob.x + ob.size / 2, ob.y);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      function drawSquareRunner(x, y, runPhase, onGround, rot) {
+        const size = state.dino.w;
+        const px = x + size / 2;
+        const py = y + size / 2;
+
+        // 캐릭터(네모)
+        ctx.save();
+        ctx.translate(px, py);
+        if (onGround) {
+          const squash = Math.abs(Math.sin(runPhase)) * 0.06;
+          ctx.scale(1 + squash, 1 - squash);
+        }
+        ctx.rotate(rot);
+        ctx.translate(-size / 2, -size / 2);
+
+        const fill = '#ffb84d';
+        const stroke = 'rgba(0,0,0,0.28)';
+        ctx.fillStyle = fill;
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.roundRect(0, 0, size, size, 12);
+        ctx.fill();
+        ctx.stroke();
+
+        // 얼굴(귀여운 느낌)
+        ctx.fillStyle = 'rgba(255,255,255,0.30)';
+        ctx.beginPath();
+        ctx.roundRect(8, 10, size - 16, size - 18, 10);
+        ctx.fill();
+
+        ctx.fillStyle = '#3b2a1a';
+        ctx.beginPath();
+        ctx.arc(size * 0.36, size * 0.40, 3.2, 0, Math.PI * 2);
+        ctx.arc(size * 0.64, size * 0.40, 3.2, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(size * 0.38, size * 0.62);
+        ctx.quadraticCurveTo(size * 0.50, size * 0.70, size * 0.62, size * 0.62);
+        ctx.stroke();
+
+        ctx.restore();
+      }
+
+      function drawGameOver(w, h) {
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(0, 0, w, h);
+
+        ctx.fillStyle = 'rgba(255,255,255,0.95)';
+        ctx.font = '700 54px system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('GAME OVER', w / 2, h / 2);
+        ctx.restore();
+      }
+
+      function aabbOverlap(a, b) {
+        return (
+          a.x < b.x + b.w &&
+          a.x + a.w > b.x &&
+          a.y < b.y + b.h &&
+          a.y + a.h > b.y
+        );
+      }
+
+      function pointInTri(p, a, b, c) {
+        // barycentric technique
+        const v0x = c.x - a.x, v0y = c.y - a.y;
+        const v1x = b.x - a.x, v1y = b.y - a.y;
+        const v2x = p.x - a.x, v2y = p.y - a.y;
+        const dot00 = v0x * v0x + v0y * v0y;
+        const dot01 = v0x * v1x + v0y * v1y;
+        const dot02 = v0x * v2x + v0y * v2y;
+        const dot11 = v1x * v1x + v1y * v1y;
+        const dot12 = v1x * v2x + v1y * v2y;
+        const invDen = 1 / (dot00 * dot11 - dot01 * dot01);
+        const u = (dot11 * dot02 - dot01 * dot12) * invDen;
+        const v = (dot00 * dot12 - dot01 * dot02) * invDen;
+        return u >= 0 && v >= 0 && (u + v) <= 1;
+      }
+
+      function pointInRect(p, r) {
+        return p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+      }
+
+      function orient(a, b, c) {
+        return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+      }
+
+      function onSegment(a, b, p) {
+        return (
+          Math.min(a.x, b.x) <= p.x && p.x <= Math.max(a.x, b.x) &&
+          Math.min(a.y, b.y) <= p.y && p.y <= Math.max(a.y, b.y)
+        );
+      }
+
+      function segmentsIntersect(a, b, c, d) {
+        const o1 = orient(a, b, c);
+        const o2 = orient(a, b, d);
+        const o3 = orient(c, d, a);
+        const o4 = orient(c, d, b);
+
+        if ((o1 > 0 && o2 < 0 || o1 < 0 && o2 > 0) && (o3 > 0 && o4 < 0 || o3 < 0 && o4 > 0)) return true;
+
+        const eps = 1e-9;
+        if (Math.abs(o1) < eps && onSegment(a, b, c)) return true;
+        if (Math.abs(o2) < eps && onSegment(a, b, d)) return true;
+        if (Math.abs(o3) < eps && onSegment(c, d, a)) return true;
+        if (Math.abs(o4) < eps && onSegment(c, d, b)) return true;
+        return false;
+      }
+
+      function rectTriIntersect(r, a, b, c) {
+        // 1) rect corners in triangle
+        const rc = [
+          { x: r.x, y: r.y },
+          { x: r.x + r.w, y: r.y },
+          { x: r.x + r.w, y: r.y + r.h },
+          { x: r.x, y: r.y + r.h }
+        ];
+        for (const p of rc) if (pointInTri(p, a, b, c)) return true;
+
+        // 2) triangle vertices in rect
+        if (pointInRect(a, r) || pointInRect(b, r) || pointInRect(c, r)) return true;
+
+        // 3) edge intersections
+        const re = [
+          [rc[0], rc[1]],
+          [rc[1], rc[2]],
+          [rc[2], rc[3]],
+          [rc[3], rc[0]]
+        ];
+        const te = [
+          [a, b],
+          [b, c],
+          [c, a]
+        ];
+        for (const [p1, p2] of re) {
+          for (const [q1, q2] of te) {
+            if (segmentsIntersect(p1, p2, q1, q2)) return true;
+          }
+        }
+        return false;
+      }
+
+      function drawDust() {
+        if (state.dust.length === 0) return;
+        ctx.save();
+        ctx.globalCompositeOperation = 'source-over';
+        for (const p of state.dust) {
+          const a = clamp(p.life / 0.48, 0, 1);
+          ctx.fillStyle = `rgba(70, 45, 20, ${0.22 * a})`;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+
+      function setGameOver(v) {
+        state.gameOver = v;
+        if (v) {
+          state.finalScore = Math.floor(state.score);
+          finalScoreEl.textContent = `점수: ${state.finalScore}`;
+
+          state.score = 0; // 요구사항: 게임 오버되면 초기화
+          scoreEl.textContent = `점수: ${Math.floor(state.score)}`;
+          overlayEl.classList.add('show');
+        } else {
+          overlayEl.classList.remove('show');
+        }
+      }
+
+      function resetGame() {
+        state.t = 0;
+        state.scrollX = 0;
+        state.score = 0;
+        state.finalScore = 0;
+        state.clouds = [];
+        state.dust = [];
+        state.obstacles = [];
+        scheduleNextCloud();
+        scheduleNextObstacle();
+        state.dino.runPhase = 0;
+        state.dino.prevRunPhase = 0;
+        state.dino.vy = 0;
+        state.dino.onGround = true;
+        state.dino.rot = 0;
+        state.dino.rotTarget = 0;
+        state.dino.y = state.ground.y - state.dino.h + 6;
+        scoreEl.textContent = `점수: ${Math.floor(state.score)}`;
+        setGameOver(false);
+      }
+
+      restartEl.addEventListener('click', () => {
+        resetGame();
+      });
+
+      function step(dt) {
+        const w = canvas.getBoundingClientRect().width;
+        const h = canvas.getBoundingClientRect().height;
+
+        if (state.gameOver) {
+          // 드로우만 유지
+          ctx.clearRect(0, 0, w, h);
+          drawBackground(w, h);
+          for (const cl of state.clouds) drawCloud(cl);
+          drawGround(w, h, state.scrollX);
+          for (const ob of state.obstacles) drawObstacle(ob);
+          drawDust();
+          drawSquareRunner(state.dino.x, state.dino.y, state.dino.runPhase, state.dino.onGround, state.dino.rot);
+          return;
+        }
+
+        state.t += dt;
+        state.scrollX += state.speed * dt;
+        state.score += state.speed * dt; // 이동거리 기반 점수
+        scoreEl.textContent = `점수: ${Math.floor(state.score)}`;
+
+        // 구름 스폰/이동
+        state.nextCloudIn -= dt;
+        if (state.nextCloudIn <= 0) {
+          if (state.clouds.length < 3) spawnCloud();
+          scheduleNextCloud();
+        }
+        for (const cl of state.clouds) {
+          cl.x -= cl.speed * dt;
+        }
+        state.clouds = state.clouds.filter(cl => cl.x + cl.w > -40);
+
+        // 장애물 스폰/이동 (땅과 함께 이동)
+        state.nextObstacleIn -= dt;
+        if (state.nextObstacleIn <= 0) {
+          spawnObstacle();
+          scheduleNextObstacle();
+        }
+        for (const ob of state.obstacles) {
+          ob.x -= state.speed * dt;
+        }
+        state.obstacles = state.obstacles.filter(ob => ob.x + ob.size > -80);
+
+        // 공룡 달리기 애니메이션
+        const runRate = 10.5; // radians/s 느낌
+        state.dino.prevRunPhase = state.dino.runPhase;
+        state.dino.runPhase += dt * runRate * (state.dino.onGround ? 1 : 0.45);
+
+        // 점프 물리
+        const groundY = state.ground.y - state.dino.h + 6;
+        state.dino.vy += state.dino.gravity * dt;
+        state.dino.y += state.dino.vy * dt;
+
+        // 점프 회전: 공중에서 목표 각도로 90도 회전
+        if (!state.dino.onGround) {
+          const maxStep = (Math.PI * 6) * dt; // rad/s
+          const diff = ((state.dino.rotTarget - state.dino.rot + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+          const step = clamp(diff, -maxStep, maxStep);
+          state.dino.rot = (state.dino.rot + step) % (Math.PI * 2);
+        }
+
+        if (state.dino.y >= groundY) {
+          state.dino.y = groundY;
+          state.dino.vy = 0;
+          state.dino.onGround = true;
+          // 착지해도 마지막 90도 회전 상태를 유지
+          state.dino.rot = state.dino.rotTarget;
+        }
+
+        // 충돌 검사: 세모(삼각형) 실제 모양 기준
+        const inset = 6; // 너무 민감하지 않게 살짝 여유
+        const dinoBox = {
+          x: state.dino.x + inset,
+          y: state.dino.y + inset,
+          w: state.dino.w - inset * 2,
+          h: state.dino.h - inset * 2
+        };
+        for (const ob of state.obstacles) {
+          const obBox = { x: ob.x, y: ob.y, w: ob.size, h: ob.size };
+          if (!aabbOverlap(dinoBox, obBox)) continue;
+
+          const a = { x: ob.x, y: ob.y + ob.size };
+          const b = { x: ob.x + ob.size, y: ob.y + ob.size };
+          const c = { x: ob.x + ob.size / 2, y: ob.y };
+          if (rectTriIntersect(dinoBox, a, b, c)) {
+            setGameOver(true);
+            break;
+          }
+        }
+
+        // 달릴 때 일정 리듬으로 흙먼지 생성 (땅에 붙어서 움직이는 느낌)
+        if (state.dino.onGround) {
+          const s0 = Math.sin(state.dino.prevRunPhase);
+          const s1 = Math.sin(state.dino.runPhase);
+          const crossed = (s0 <= 0 && s1 > 0);
+          if (crossed) {
+            const dustX = state.dino.x + 10;
+            const dustY = state.ground.y + 2;
+            spawnDust(dustX, dustY);
+          }
+        }
+
+        // 흙먼지 업데이트
+        for (const p of state.dust) {
+          p.life -= dt;
+          p.vy += 680 * dt;
+          p.x += p.vx * dt;
+          p.y += p.vy * dt;
+          p.r *= (1 - dt * 1.4);
+        }
+        state.dust = state.dust.filter(p => p.life > 0 && p.r > 0.6);
+
+        // 드로우
+        ctx.clearRect(0, 0, w, h);
+        drawBackground(w, h);
+
+        // 구름은 하늘 영역에만
+        for (const cl of state.clouds) drawCloud(cl);
+
+        drawGround(w, h, state.scrollX);
+
+        for (const ob of state.obstacles) drawObstacle(ob);
+
+        drawDust();
+
+        // 캐릭터 (왼쪽 끝에서 계속 달림)
+        drawSquareRunner(state.dino.x, state.dino.y, state.dino.runPhase, state.dino.onGround, state.dino.rot);
+      }
+
+      function loop(nowMs) {
+        const dt = clamp((nowMs - state.lastMs) / 1000, 0, 0.033);
+        state.lastMs = nowMs;
+        step(dt);
+        requestAnimationFrame(loop);
+      }
+
+      // CanvasRenderingContext2D.roundRect 폴백 (구형 브라우저 대비)
+      if (!CanvasRenderingContext2D.prototype.roundRect) {
+        CanvasRenderingContext2D.prototype.roundRect = function (x, y, w, h, r) {
+          const rr = Array.isArray(r) ? r : [r, r, r, r];
+          const [r1, r2, r3, r4] = rr.map(v => Math.max(0, Math.min(v, Math.min(w, h) / 2)));
+          this.beginPath();
+          this.moveTo(x + r1, y);
+          this.lineTo(x + w - r2, y);
+          this.quadraticCurveTo(x + w, y, x + w, y + r2);
+          this.lineTo(x + w, y + h - r3);
+          this.quadraticCurveTo(x + w, y + h, x + w - r3, y + h);
+          this.lineTo(x + r4, y + h);
+          this.quadraticCurveTo(x, y + h, x, y + h - r4);
+          this.lineTo(x, y + r1);
+          this.quadraticCurveTo(x, y, x + r1, y);
+          this.closePath();
+          return this;
+        };
+      }
+
+      // 초기화
+      scheduleNextCloud();
+      scheduleNextObstacle();
+      resize();
+      window.addEventListener('resize', resize);
+      scoreEl.textContent = `점수: ${Math.floor(state.score)}`;
+      requestAnimationFrame(loop);
+    })();
+  </script>
+</body>
+</html>
